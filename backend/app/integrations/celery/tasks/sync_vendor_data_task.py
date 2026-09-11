@@ -274,6 +274,11 @@ def sync_vendor_data(
                 try:
                     strategy = factory.get_provider(provider_name)
                     provider_result = ProviderSyncResult(success=True, params={})
+                    # Tracks whether any section below failed, so a transient error (e.g. a
+                    # DNS blip during token refresh) doesn't let last_synced_at advance past
+                    # a window that was never actually fetched — see update_last_synced_at
+                    # call below.
+                    sync_had_failure = False
 
                     # New-vs-updated split for the sync-log (timeseries upserts report it
                     # via WriteCounts). items_processed is derived from these so the headline
@@ -369,6 +374,7 @@ def sync_vendor_data(
                                     error=str(e),
                                 )
                             )
+                            sync_had_failure = True
 
                     # Sync 247 data (sleep, recovery, activity) and SAVE to database
                     if hasattr(strategy, "data_247") and strategy.data_247:
@@ -471,8 +477,16 @@ def sync_vendor_data(
                                     error=str(e),
                                 )
                             )
+                            sync_had_failure = True
 
-                    if not is_historical:
+                    # A failed section means part of [effective_start, now) was never
+                    # actually fetched. Advancing the cursor anyway would make that gap
+                    # permanent — no future periodic sync re-checks a window once
+                    # last_synced_at has moved past it. Leaving it unset means the next
+                    # run's effective_start still covers the missed window (widened by
+                    # the trailing lookback above), and the rollup/workout upserts are
+                    # idempotent so re-fetching already-synced data is safe.
+                    if not is_historical and not sync_had_failure:
                         user_connection_repo.update_last_synced_at(db, connection)
 
                     if shared_token and connection.provider_user_id:
