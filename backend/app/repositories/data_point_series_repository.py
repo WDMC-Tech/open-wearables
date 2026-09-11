@@ -1,5 +1,5 @@
 import contextlib
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import LiteralString, NamedTuple
 from typing import cast as typing_cast
@@ -388,12 +388,12 @@ class DataPointSeriesRepository(
             query = query.filter(self.model.recorded_at >= params.start_datetime)
 
         if params.end_datetime:
-            # If user didnt specify an hour, minute nor second, add 1 day to include the entire day
-            end_dt = params.end_datetime
-            # Check if the time part after the date is 00:00:00
-            if end_dt.time() == time.min:
-                end_dt = end_dt + timedelta(days=1)
-            query = query.filter(self.model.recorded_at < end_dt)
+            # Bare-date-means-whole-day inclusivity is applied by the caller (see
+            # parse_query_end_datetime) while the original query string is still available.
+            # Guessing it here from the parsed datetime's clock reading can't tell a bare
+            # date apart from an intentional exact-midnight instant — both parse to the same
+            # value — and would silently widen a precise 24h request into 48h.
+            query = query.filter(self.model.recorded_at < params.end_datetime)
 
         # Calculate total count BEFORE applying cursor pagination
         # This gives us the total matching records (after all other filters)

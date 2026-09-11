@@ -1,4 +1,5 @@
-from datetime import datetime, timezone
+import re
+from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import Query
@@ -40,6 +41,22 @@ ZoneOffset = Annotated[
 ]
 
 
+_BARE_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def is_bare_date_string(dt_str: str) -> bool:
+    """True if ``dt_str`` is a date-only string (``2023-11-07``) with no time component.
+
+    Once parsed, a bare date and an explicit exact-midnight timestamp
+    (``2023-11-07T00:00:00Z``) are indistinguishable ``datetime`` objects — the raw string
+    is the only place caller intent survives. Callers that mean to treat a bare end date as
+    "through the end of that day" (see ``parse_query_end_datetime``) must check the string,
+    not the parsed value's clock reading, or an intentional exact-midnight boundary silently
+    grows to include an extra day.
+    """
+    return bool(_BARE_DATE_RE.match(dt_str.strip()))
+
+
 def parse_query_datetime(dt_str: str) -> datetime:
     """Parse datetime from ISO string or Unix timestamp (seconds).
 
@@ -56,6 +73,22 @@ def parse_query_datetime(dt_str: str) -> datetime:
         return datetime.fromisoformat(dt_str)
     except ValueError:
         raise DatetimeParseError(dt_str)
+
+
+def parse_query_end_datetime(dt_str: str) -> datetime:
+    """Parse an ``end_time``/``end_date`` query param, treating a bare date as inclusive.
+
+    A caller passing ``2023-11-07`` means "through the end of November 7th", so the result
+    is advanced by one day to make an exclusive ``< end`` filter behave inclusively for that
+    whole day. A caller passing a fully-qualified timestamp — including an exact midnight
+    instant like ``2023-11-07T00:00:00Z`` — gets that exact instant back, unadjusted: once
+    parsed, that value is indistinguishable from a bare date, so the string is checked before
+    parsing rather than guessing from the parsed clock reading.
+    """
+    parsed = parse_query_datetime(dt_str)
+    if is_bare_date_string(dt_str):
+        parsed = parsed + timedelta(days=1)
+    return parsed
 
 
 def parse_iso_datetime(dt_str: str | None) -> datetime | None:
