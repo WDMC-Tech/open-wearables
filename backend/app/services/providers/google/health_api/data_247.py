@@ -9,7 +9,7 @@ come from the sessions endpoint and are handled separately.
 """
 
 from collections.abc import Iterator
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, NoReturn
 from uuid import UUID, uuid4
@@ -179,9 +179,19 @@ class GoogleHealth247Data(Base247DataTemplate):
         page_size = min(spec.max_range_days * windows_per_day, self.MAX_PAGE_SIZE)
         is_daily_total = granularity == DataGranularity.DAILY
 
+        # Anchor to a fixed calendar grid (e.g. the top of the hour) rather than
+        # start_time's raw wall-clock minute. start_time is last_synced_at (optionally
+        # minus a trailing lookback) — an arbitrary instant equal to whenever a previous
+        # sync happened to finish, not an hour boundary. Without this floor, each sync
+        # run requests a differently-offset bucket grid, so the same real hour comes
+        # back with a different rollupDataPoints startTime each time and lands as a
+        # new row instead of an upsert (see uq_data_point_series_mapping_type_time) —
+        # duplicating totals like total-calories every run that overlaps.
+        aligned_start = self._floor_to_window(start_time, window_seconds)
+
         endpoint = ROLLUP_ENDPOINT.format(data_type=metric.data_type)
         samples: list[TimeSeriesSampleCreate] = []
-        for chunk_start, chunk_end in self._chunk_range(start_time, end_time, spec.max_range_days):
+        for chunk_start, chunk_end in self._chunk_range(aligned_start, end_time, spec.max_range_days):
             for point in self._fetch_rollup_window(
                 db, user_id, endpoint, chunk_start, chunk_end, window_seconds, page_size
             ):
@@ -241,6 +251,13 @@ class GoogleHealth247Data(Base247DataTemplate):
             if not page_token:
                 break
         return points
+
+    @staticmethod
+    def _floor_to_window(dt: datetime, window_seconds: int) -> datetime:
+        """Round a timestamp down to the nearest fixed epoch-aligned window boundary."""
+        epoch = int(dt.timestamp())
+        floored = epoch - (epoch % window_seconds)
+        return datetime.fromtimestamp(floored, tz=timezone.utc)
 
     @staticmethod
     def _chunk_range(start: datetime, end: datetime, max_days: int) -> Iterator[tuple[datetime, datetime]]:
