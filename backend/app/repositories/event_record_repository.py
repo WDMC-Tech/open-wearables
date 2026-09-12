@@ -145,6 +145,10 @@ class EventRecordRepository(
 
     @handle_exceptions
     def create(self, db_session: DbSession, creator: EventRecordCreate) -> EventRecord:
+        """Insert a new record, or refresh the existing one on a duplicate (data_source_id,
+        start_datetime, end_datetime) - a provider may revise a session's type/duration/etc.
+        after our first sync already captured it, so a re-fetch must not be a silent no-op.
+        """
         data_source_id, creation = self._build_creation(db_session, creator)
         try:
             db_session.add(creation)
@@ -154,8 +158,26 @@ class EventRecordRepository(
         except IntegrityError:
             db_session.rollback()
             if existing := self._fetch_existing(db_session, data_source_id, creation):
-                return existing
+                return self._apply_update(db_session, existing, creator)
             raise
+
+    def _apply_update(
+        self,
+        db_session: DbSession,
+        existing: EventRecord,
+        creator: EventRecordCreate,
+    ) -> EventRecord:
+        """Refresh a pre-existing record's mutable fields from a re-fetch of the same session.
+
+        id/data_source_id/start_datetime/end_datetime are the identity (matched by the caller)
+        and stay untouched; everything else may legitimately change between fetches.
+        """
+        for field_name in ("external_id", "category", "type", "source_name", "duration_seconds", "zone_offset"):
+            setattr(existing, field_name, getattr(creator, field_name))
+        db_session.add(existing)
+        db_session.commit()
+        db_session.refresh(existing)
+        return existing
 
     def create_and_flush(self, db_session: DbSession, creator: EventRecordCreate) -> EventRecord:
         """Like create() but flushes instead of committing; caller is responsible for the commit.

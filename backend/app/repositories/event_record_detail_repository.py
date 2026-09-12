@@ -48,7 +48,9 @@ class EventRecordDetailRepository(
     ) -> EventRecordDetail:
         """Create a detail record using the appropriate polymorphic model.
 
-        Idempotent on record_id: returns the existing row on duplicate insert.
+        Idempotent on record_id: refreshes the existing row's fields on a duplicate insert
+        rather than discarding the newly-fetched data (a provider often finalizes a
+        workout/sleep session's metrics - calories, HR, distance - after our first sync).
         """
         detail = self._build_detail(creator, detail_type)
         try:
@@ -62,8 +64,29 @@ class EventRecordDetailRepository(
             if isinstance(exc.orig, UniqueViolation) and (
                 existing := self.get_by_record_id(db_session, creator.record_id, detail_type)
             ):
-                return existing
+                return self._apply_update(db_session, existing, creator)
             raise
+
+    def _apply_update(
+        self,
+        db_session: DbSession,
+        existing: EventRecordDetail,
+        creator: EventRecordDetailCreate,
+    ) -> EventRecordDetail:
+        """Refresh a pre-existing detail row's fields from a re-fetch of the same record.
+
+        Mirrors _build_detail's exclude_none + sleep_stages JSON-mode handling, so a field
+        the provider doesn't report this time doesn't wipe a previously-stored value.
+        """
+        creation_data = creator.model_dump(exclude_none=True, exclude={"record_id"})
+        if creator.sleep_stages:
+            creation_data["sleep_stages"] = [s.model_dump(mode="json") for s in creator.sleep_stages]
+        for field_name, field_value in creation_data.items():
+            setattr(existing, field_name, field_value)
+        db_session.add(existing)
+        db_session.commit()
+        db_session.refresh(existing)
+        return existing
 
     def create_and_flush(
         self,
