@@ -30,6 +30,7 @@ from app.schemas.responses.incoming_webhooks import (
     WebhookOperationResult,
     WebhookSubscriptionStatus,
 )
+from app.services.providers.google.health_api.helpers import google_scope_granted
 from app.services.providers.google.health_api.metrics import METRICS
 from app.services.providers.templates.base_webhook_service import BaseWebhookService
 from app.utils.structured_logging import log_structured
@@ -75,10 +76,13 @@ GOOGLE_WEBHOOK_SUPPORTED_DATA_TYPES = frozenset(
 
 # Subscribe to the handled types (24/7 metrics + sessions) that Google supports for webhooks.
 # AUTOMATIC lets Google create per-user subscriptions itself as users connect.
+# "sleep" drops out when its scope is not configured -- subscribing to a data type we
+# cannot read would have Google push notifications that every fetch then 403s on.
 GOOGLE_WEBHOOK_DATA_TYPES = [
     data_type
     for data_type in ([m.data_type for m in METRICS] + ["sleep", "exercise"])
     if data_type in GOOGLE_WEBHOOK_SUPPORTED_DATA_TYPES
+    and (data_type != "sleep" or google_scope_granted("sleep"))
 ]
 
 

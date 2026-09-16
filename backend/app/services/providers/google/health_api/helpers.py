@@ -4,10 +4,26 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
+from app.config import settings
 from app.utils.conversion import to_decimal
 from app.utils.dates import offset_to_iso, to_rfc3339
 
 GOOGLE_HEALTH_API_SOURCE = "google_health_api"
+
+GOOGLE_HEALTH_SCOPE_PREFIX = "https://www.googleapis.com/auth/googlehealth."
+
+
+def google_scope_granted(family: str) -> bool:
+    """True when <family>.readonly is in the configured Google scope list.
+
+    Google Health grants access per data family, so a data type whose scope was left out
+    of GOOGLE_DEFAULT_SCOPE can never be read - every request for it comes back 403.
+    Callers check this and skip such a family outright instead of spending a request per
+    sync to be refused. Narrowing GOOGLE_DEFAULT_SCOPE (see backend/config/.env) is how a
+    deployment opts out of a family it does not use; putting the scope back re-enables it
+    with no code change.
+    """
+    return f"{GOOGLE_HEALTH_SCOPE_PREFIX}{family}.readonly" in settings.google_default_scope.split()
 
 
 def physical_interval(start: datetime, end: datetime) -> dict[str, str]:

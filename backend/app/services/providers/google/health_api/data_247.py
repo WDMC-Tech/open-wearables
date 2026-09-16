@@ -27,6 +27,7 @@ from app.services.providers.api_client import make_authenticated_request
 from app.services.providers.google.health_api.helpers import (
     GOOGLE_HEALTH_API_SOURCE,
     extract_source,
+    google_scope_granted,
     parse_date,
     parse_rfc3339,
     physical_interval,
@@ -92,12 +93,19 @@ class GoogleHealth247Data(Base247DataTemplate):
             if counts is not None:
                 results[metric.data_type] = counts
 
-        try:
-            sleep_count = self.sleep.load_and_save(db, user_id, start_time, end_time)
-            succeeded += 1
-        except Exception as e:
-            self._log_metric_failure("sleep", user_id, e)
-            failures["sleep"] = str(e)
+        # Skipped entirely when the sleep scope is not configured: without it every call
+        # here is a guaranteed 403, which would log a failure on every sync forever. Not
+        # attempting it also keeps it out of `succeeded`/`failures`, so an otherwise
+        # healthy run is not reported as partially failed.
+        if google_scope_granted("sleep"):
+            try:
+                sleep_count = self.sleep.load_and_save(db, user_id, start_time, end_time)
+                succeeded += 1
+            except Exception as e:
+                self._log_metric_failure("sleep", user_id, e)
+                failures["sleep"] = str(e)
+                sleep_count = 0
+        else:
             sleep_count = 0
 
         if results or sleep_count:
