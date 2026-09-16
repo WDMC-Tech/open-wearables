@@ -206,7 +206,7 @@ class Settings(BaseSettings):
     # GOOGLE OAUTH SETTINGS
     google_client_id: str | None = None
     google_client_secret: SecretStr | None = None
-    # Only the families this deployment actually reads. nutrition and sleep were dropped
+    # Only the families this deployment actually reads. nutrition, sleep and settings were dropped
     # 2026-09-16: Google reviews each restricted scope against demonstrated use, and the
     # consuming app reads neither (it takes steps/energy/workouts and weight, and sources
     # its own nutrition elsewhere). Adding a family back here is enough to re-enable it --
@@ -214,8 +214,7 @@ class Settings(BaseSettings):
     google_default_scope: str = (
         "openid email "
         "https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly "
-        "https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly "
-        "https://www.googleapis.com/auth/googlehealth.settings.readonly"
+        "https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly"
     )
     # Bearer secret Google echoes in the Authorization header of every webhook
     # notification. Defaults to secret_key (see derive_google_webhook_secret).
