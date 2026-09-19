@@ -3,6 +3,7 @@ what the 24/7 handler emits. Add a metric by appending one ``DataTypeMetric`` to
 relevant family module. Spec types live in ``app.schemas.providers.google``.
 """
 
+from app.config import settings
 from app.schemas.providers.google import DataTypeMetric
 from app.services.providers.google.health_api.helpers import google_scope_granted
 from app.services.providers.google.health_api.metrics.activity import ACTIVITY_METRICS
@@ -18,13 +19,21 @@ from app.services.providers.google.health_api.metrics.vitals import VITALS_METRI
 # derived from METRICS, so we do not subscribe to pushes we could never read either.
 _SCOPE_GATED_DATA_TYPES = {"hydration-log": "nutrition"}
 
+# Deployment allowlist: only ingest the data types this integration actually reads. Separate
+# from the scope gate above -- that one drops what Google would refuse, this one drops what we
+# would fetch, store, and never look at. Empty means no restriction.
+_ALLOWED_DATA_TYPES = {t.strip() for t in settings.google_data_types.split(",") if t.strip()}
+
 _ALL_METRICS = (*ACTIVITY_METRICS, *HEART_METRICS, *BODY_METRICS, *VITALS_METRICS)
 
 METRICS: tuple[DataTypeMetric, ...] = tuple(
     metric
     for metric in _ALL_METRICS
-    if metric.data_type not in _SCOPE_GATED_DATA_TYPES
-    or google_scope_granted(_SCOPE_GATED_DATA_TYPES[metric.data_type])
+    if (not _ALLOWED_DATA_TYPES or metric.data_type in _ALLOWED_DATA_TYPES)
+    and (
+        metric.data_type not in _SCOPE_GATED_DATA_TYPES
+        or google_scope_granted(_SCOPE_GATED_DATA_TYPES[metric.data_type])
+    )
 )
 
 __all__ = ["METRICS"]

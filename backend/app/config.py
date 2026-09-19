@@ -231,6 +231,13 @@ class Settings(BaseSettings):
     # with RAW granularity, either list or reconcile is used
     # true - reconcile, false - list; for details check docs
     google_use_reconcile: bool = True
+    # Data types to ingest, comma-separated; empty means every type in the registry (upstream
+    # behaviour). Google returns far more than most integrations read -- one 7-day connect for a
+    # single user pulled 232k heart-rate points alongside SpO2, HRV and respiratory rate, none of
+    # which Giving Wellness displays. Storing health data nobody reads is cost, noise, and PHI we
+    # would have to defend holding. Narrowing here also narrows the webhook subscriptions, since
+    # GOOGLE_WEBHOOK_DATA_TYPES derives from the same registry.
+    google_data_types: str = "steps,total-calories,weight"
 
     withings_client_id: str | None = None
     withings_client_secret: SecretStr | None = None
