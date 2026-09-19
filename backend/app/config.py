@@ -106,6 +106,10 @@ class Settings(BaseSettings):
     # Pre-0.4.2 behaviour. Set to false once your integration calls /sync/historical explicitly.
     # Will default to false in a future release.
     historical_sync_on_connect: bool = True
+    # How far back that connect-time backfill reaches. Upstream hardcoded 90 days, which for a
+    # single Google user pulled ~240k rows -- almost all of it heart rate and SpO2 that Giving
+    # Wellness never reads. 7 days covers the Journal's history without the import.
+    historical_sync_on_connect_days: int = 7
 
     # Whether to ingest per-second workout samples (speed, cadence, power, GPS, etc.) into
     # data_point_series on workout webhook arrival. Significantly increases DB storage.

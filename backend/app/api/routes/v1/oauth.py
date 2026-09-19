@@ -109,7 +109,7 @@ def oauth_callback(
             from app.integrations.celery.tasks import sync_vendor_data
 
             now = datetime.now(timezone.utc)
-            start_date = (now - timedelta(days=90)).isoformat()
+            start_date = (now - timedelta(days=settings.historical_sync_on_connect_days)).isoformat()
             sync_vendor_data.delay(
                 user_id=str(oauth_state.user_id),
                 start_date=start_date,
