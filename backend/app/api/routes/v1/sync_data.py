@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Annotated, Any
 from uuid import UUID
@@ -143,7 +143,7 @@ def sync_user_data(
 
         start_date_iso: str | None = None
         if since > 0:
-            start_date_iso = datetime.fromtimestamp(since).isoformat()
+            start_date_iso = datetime.fromtimestamp(since, timezone.utc).isoformat()
         elif summary_start_time:
             start_date_iso = summary_start_time
 
@@ -191,8 +191,14 @@ def sync_user_data(
             if load_fn is None:
                 results["data_247"] = None
             else:
-                start_dt = datetime.fromtimestamp(since) if since else datetime.now() - timedelta(days=30)
-                end_dt = datetime.now()
+                # Timezone-aware, like the Celery path. These flow into comparisons against
+                # provider timestamps that always carry an offset, so naive values raised
+                # "can't compare offset-naive and offset-aware datetimes" for every data type and
+                # the endpoint 500'd -- while the scheduled sync, which builds aware values, was
+                # fine. Only callers of this synchronous route ever saw it.
+                now = datetime.now(timezone.utc)
+                start_dt = datetime.fromtimestamp(since, timezone.utc) if since else now - timedelta(days=30)
+                end_dt = now
                 results["data_247"] = load_fn(db, user_id, start_time=start_dt, end_time=end_dt)
         elif data_type == SyncDataType.DATA_247:
             raise HTTPException(
