@@ -58,5 +58,7 @@ echo "Starting the FastAPI application..."
 if [ "$ENVIRONMENT" = "local" ]; then
     uv run fastapi dev app/main.py --host 0.0.0.0 --port "${API_PORT:-8000}"
 else
-    uv run fastapi run app/main.py --host 0.0.0.0 --port "${API_PORT:-8000}"
+    # What `fastapi run` does (no reload, proxy headers on), plus no "Server: uvicorn" header:
+    # advertising the server software only helps a scanner pick exploits.
+    uv run uvicorn app.main:api --host 0.0.0.0 --port "${API_PORT:-8000}" --proxy-headers --no-server-header
 fi
