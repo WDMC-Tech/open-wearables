@@ -2,130 +2,338 @@
 Tests for OAuth endpoints.
 
 Tests the /api/v1/oauth endpoints including:
-- GET /api/v1/oauth/{provider}/authorize - test authorize redirect
+- GET /api/v1/oauth/{provider}/authorize - API key, redirect allowlist
+- GET /api/v1/oauth/{provider}/callback + POST /{provider}/complete - flow bound to its user
 - GET /api/v1/oauth/providers - test list providers
 - PUT /api/v1/oauth/providers/{provider} - test update provider status
 """
 
-from unittest.mock import MagicMock
+from collections.abc import Generator
+from typing import Any
+from unittest.mock import MagicMock, patch
+from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
+import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from tests.factories import DeveloperFactory
-from tests.utils import developer_auth_headers
+from app.config import settings
+from app.models import UserConnection
+from tests.factories import ApiKeyFactory, DeveloperFactory, UserFactory
+from tests.utils import api_key_headers, developer_auth_headers
+
+ALLOWED_REDIRECT = "https://beta.givingwellness.org/wearables/callback"
+
+
+@pytest.fixture(autouse=True)
+def _require_completion() -> Generator[None, None, None]:
+    """The deployment default (conftest turns it off for the provider unit tests)."""
+    with patch.object(settings, "oauth_require_completion", True):
+        yield
+
+
+@pytest.fixture
+def key_headers(db: Session) -> dict[str, str]:
+    return api_key_headers(ApiKeyFactory().plain_key)
 
 
 class TestOAuthAuthorizeEndpoint:
     """Test suite for OAuth authorization endpoint."""
 
-    def test_authorize_provider_success(self, client: TestClient, db: Session) -> None:
-        """Test successfully initiating OAuth flow for a provider."""
-        # Arrange
-        user_id = uuid4()
-
-        # Act
+    def test_authorize_provider_success(self, client: TestClient, db: Session, key_headers: dict[str, str]) -> None:
         response = client.get(
             "/api/v1/oauth/garmin/authorize",
-            params={"user_id": str(user_id)},
+            params={"user_id": str(uuid4()), "redirect_uri": ALLOWED_REDIRECT},
+            headers=key_headers,
         )
 
-        # Assert
         assert response.status_code == 200
         data = response.json()
-        assert "authorization_url" in data
-        assert "state" in data
         assert isinstance(data["authorization_url"], str)
         assert isinstance(data["state"], str)
         assert len(data["state"]) > 0
 
-    def test_authorize_provider_with_redirect_uri(self, client: TestClient, db: Session) -> None:
-        """Test OAuth flow with optional redirect URI."""
-        # Arrange
-        user_id = uuid4()
-        redirect_uri = "https://myapp.com/oauth/callback"
-
-        # Act
+    def test_authorize_requires_api_key(self, client: TestClient, db: Session) -> None:
         response = client.get(
-            "/api/v1/oauth/garmin/authorize",
-            params={
-                "user_id": str(user_id),
-                "redirect_uri": redirect_uri,
-            },
+            "/api/v1/oauth/google/authorize",
+            params={"user_id": str(uuid4()), "redirect_uri": ALLOWED_REDIRECT},
         )
 
-        # Assert
+        assert response.status_code == 401
+
+    def test_authorize_rejects_invalid_api_key(self, client: TestClient, db: Session) -> None:
+        response = client.get(
+            "/api/v1/oauth/google/authorize",
+            params={"user_id": str(uuid4()), "redirect_uri": ALLOWED_REDIRECT},
+            headers=api_key_headers("sk-not-a-real-key"),
+        )
+
+        assert response.status_code == 401
+
+    def test_authorize_accepts_developer_token(self, client: TestClient, db: Session) -> None:
+        response = client.get(
+            "/api/v1/oauth/garmin/authorize",
+            params={"user_id": str(uuid4()), "redirect_uri": ALLOWED_REDIRECT},
+            headers=developer_auth_headers(DeveloperFactory().id),
+        )
+
         assert response.status_code == 200
-        data = response.json()
-        assert "authorization_url" in data
-        assert "state" in data
 
-    def test_authorize_different_providers(self, client: TestClient, db: Session) -> None:
-        """Test initiating OAuth for different providers."""
-        # Arrange
-        user_id = uuid4()
-        providers = ["garmin", "polar", "suunto"]
+    @pytest.mark.parametrize(
+        "redirect_uri",
+        [
+            "https://evil.example.com/callback",
+            "https://beta.givingwellness.org.evil.example.com/callback",
+            "https://evil.example.com/?next=https://beta.givingwellness.org",
+            "https://user@beta.givingwellness.org/callback",
+            "http://beta.givingwellness.org/wearables/callback",  # wrong scheme
+            "https://beta.givingwellness.org:8443/callback",  # wrong port
+            "https:\\\\evil.example.com",
+            "//evil.example.com/callback",
+            "javascript:alert(1)",
+            "/relative/path",
+        ],
+    )
+    def test_authorize_rejects_redirect_outside_allowlist(
+        self, client: TestClient, db: Session, key_headers: dict[str, str], redirect_uri: str
+    ) -> None:
+        response = client.get(
+            "/api/v1/oauth/google/authorize",
+            params={"user_id": str(uuid4()), "redirect_uri": redirect_uri},
+            headers=key_headers,
+        )
 
-        for provider in providers:
-            # Act
+        assert response.status_code == 400
+
+    def test_authorize_requires_redirect_uri_when_completion_required(
+        self, client: TestClient, db: Session, key_headers: dict[str, str]
+    ) -> None:
+        response = client.get(
+            "/api/v1/oauth/google/authorize",
+            params={"user_id": str(uuid4())},
+            headers=key_headers,
+        )
+
+        assert response.status_code == 400
+
+    def test_google_authorize_uses_pkce(self, client: TestClient, db: Session, key_headers: dict[str, str]) -> None:
+        response = client.get(
+            "/api/v1/oauth/google/authorize",
+            params={"user_id": str(uuid4()), "redirect_uri": ALLOWED_REDIRECT},
+            headers=key_headers,
+        )
+
+        assert response.status_code == 200
+        query = parse_qs(urlsplit(response.json()["authorization_url"]).query)
+        assert query["code_challenge_method"] == ["S256"]
+        assert len(query["code_challenge"][0]) >= 43
+        assert query["state"] == [response.json()["state"]]
+
+    def test_authorize_different_providers(self, client: TestClient, db: Session, key_headers: dict[str, str]) -> None:
+        for provider in ["garmin", "polar", "suunto", "google"]:
             response = client.get(
                 f"/api/v1/oauth/{provider}/authorize",
-                params={"user_id": str(user_id)},
+                params={"user_id": str(uuid4()), "redirect_uri": ALLOWED_REDIRECT},
+                headers=key_headers,
             )
 
-            # Assert
             assert response.status_code == 200
             data = response.json()
             assert "authorization_url" in data
             assert "state" in data
 
-    def test_authorize_missing_user_id(self, client: TestClient, db: Session) -> None:
-        """Test authorization without user_id parameter."""
-        # Act
-        response = client.get("/api/v1/oauth/garmin/authorize")
+    def test_authorize_missing_user_id(self, client: TestClient, db: Session, key_headers: dict[str, str]) -> None:
+        response = client.get("/api/v1/oauth/garmin/authorize", headers=key_headers)
 
-        # Assert
         assert response.status_code == 400
 
-    def test_authorize_invalid_user_id(self, client: TestClient, db: Session) -> None:
-        """Test authorization with invalid user_id format."""
-        # Act
+    def test_authorize_invalid_user_id(self, client: TestClient, db: Session, key_headers: dict[str, str]) -> None:
         response = client.get(
             "/api/v1/oauth/garmin/authorize",
             params={"user_id": "not-a-uuid"},
+            headers=key_headers,
         )
 
-        # Assert
         assert response.status_code == 400
 
-    def test_authorize_invalid_provider(self, client: TestClient, db: Session) -> None:
-        """Test authorization with non-existent provider."""
-        # Arrange
-        user_id = uuid4()
-
-        # Act
+    def test_authorize_invalid_provider(self, client: TestClient, db: Session, key_headers: dict[str, str]) -> None:
         response = client.get(
             "/api/v1/oauth/invalid-provider/authorize",
-            params={"user_id": str(user_id)},
+            params={"user_id": str(uuid4())},
+            headers=key_headers,
         )
 
-        # Assert
         assert response.status_code == 400
 
-    def test_authorize_non_oauth_provider(self, client: TestClient, db: Session) -> None:
-        """Test authorization with provider that doesn't support OAuth."""
-        # Arrange
-        user_id = uuid4()
-
-        # Act - Try to authorize with "apple" which uses file import, not OAuth
+    def test_authorize_non_oauth_provider(self, client: TestClient, db: Session, key_headers: dict[str, str]) -> None:
+        # "apple" uses file import, not OAuth
         response = client.get(
             "/api/v1/oauth/apple/authorize",
-            params={"user_id": str(user_id)},
+            params={"user_id": str(uuid4()), "redirect_uri": ALLOWED_REDIRECT},
+            headers=key_headers,
         )
 
-        # Assert - Should fail because apple doesn't have OAuth
         assert response.status_code in [400, 401, 422]
+
+
+def _google_token_response() -> MagicMock:
+    response = MagicMock()
+    response.json.return_value = {
+        "access_token": "ya29.plain-access-token",
+        "refresh_token": "1//plain-refresh-token",
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "scope": "openid email",
+    }
+    response.raise_for_status = MagicMock()
+    return response
+
+
+def _identity_response(*args: Any, **kwargs: Any) -> MagicMock:
+    response = MagicMock()
+    response.raise_for_status = MagicMock()
+    response.json.return_value = {"healthUserId": "health-123", "email": "member@example.com"}
+    return response
+
+
+@pytest.fixture
+def google_http() -> Generator[dict[str, MagicMock], None, None]:
+    """Google's token + identity endpoints and the post-connect sync task, mocked."""
+    with (
+        patch("httpx.post", return_value=_google_token_response()) as post,
+        patch("httpx.get", side_effect=_identity_response),
+        patch("app.integrations.celery.tasks.sync_vendor_data.delay") as sync,
+    ):
+        yield {"post": post, "sync": sync}
+
+
+class TestOAuthFlowBoundToUser:
+    """The callback parks the tokens; only the user who started the flow can complete it."""
+
+    def _start_and_callback(self, client: TestClient, key_headers: dict[str, str], user_id: str) -> str:
+        auth = client.get(
+            "/api/v1/oauth/google/authorize",
+            params={"user_id": user_id, "redirect_uri": ALLOWED_REDIRECT},
+            headers=key_headers,
+        ).json()
+        callback = client.get(
+            "/api/v1/oauth/google/callback",
+            params={"code": "auth-code", "state": auth["state"]},
+            follow_redirects=False,
+        )
+        assert callback.status_code == 303
+        location = callback.headers["location"]
+        assert location.startswith(ALLOWED_REDIRECT + "?")
+        query = parse_qs(urlsplit(location).query)
+        assert query["provider"] == ["google"]
+        return query["ow_completion"][0]
+
+    def test_callback_does_not_connect_until_completed(
+        self, client: TestClient, db: Session, key_headers: dict[str, str], google_http: dict[str, MagicMock]
+    ) -> None:
+        user = UserFactory()
+
+        self._start_and_callback(client, key_headers, str(user.id))
+
+        assert db.query(UserConnection).filter_by(user_id=user.id).count() == 0
+        # PKCE: the code exchange carried the verifier
+        assert "code_verifier" in google_http["post"].call_args.kwargs["data"]
+
+    def test_same_user_completes_and_tokens_are_encrypted(
+        self, client: TestClient, db: Session, key_headers: dict[str, str], google_http: dict[str, MagicMock]
+    ) -> None:
+        user = UserFactory()
+        completion = self._start_and_callback(client, key_headers, str(user.id))
+
+        response = client.post(
+            "/api/v1/oauth/google/complete",
+            json={"user_id": str(user.id), "completion": completion},
+            headers=key_headers,
+        )
+
+        assert response.status_code == 200
+        connection = db.query(UserConnection).filter_by(user_id=user.id, provider="google").one()
+        assert connection.access_token == "ya29.plain-access-token"  # decrypted by the ORM
+        raw_access, raw_refresh = db.execute(
+            text("SELECT access_token, refresh_token FROM user_connection WHERE id = :id"), {"id": connection.id}
+        ).one()
+        assert raw_access.startswith("owenc1:")
+        assert "plain-access-token" not in raw_access
+        assert raw_refresh.startswith("owenc1:")
+        assert "plain-refresh-token" not in raw_refresh
+        google_http["sync"].assert_called_once()
+
+        # one-time: a replay is refused
+        replay = client.post(
+            "/api/v1/oauth/google/complete",
+            json={"user_id": str(user.id), "completion": completion},
+            headers=key_headers,
+        )
+        assert replay.status_code == 400
+
+    def test_other_user_cannot_complete(
+        self, client: TestClient, db: Session, key_headers: dict[str, str], google_http: dict[str, MagicMock]
+    ) -> None:
+        starter, victim = UserFactory(), UserFactory()
+        completion = self._start_and_callback(client, key_headers, str(starter.id))
+
+        response = client.post(
+            "/api/v1/oauth/google/complete",
+            json={"user_id": str(victim.id), "completion": completion},
+            headers=key_headers,
+        )
+
+        assert response.status_code == 403
+        assert db.query(UserConnection).filter(UserConnection.user_id.in_([starter.id, victim.id])).count() == 0
+        # and the parked flow is gone, so the starter cannot pick it up afterwards either
+        retry = client.post(
+            "/api/v1/oauth/google/complete",
+            json={"user_id": str(starter.id), "completion": completion},
+            headers=key_headers,
+        )
+        assert retry.status_code == 400
+
+    def test_complete_requires_api_key(self, client: TestClient, db: Session) -> None:
+        response = client.post(
+            "/api/v1/oauth/google/complete",
+            json={"user_id": str(uuid4()), "completion": "anything"},
+        )
+
+        assert response.status_code == 401
+
+    def test_provider_error_returns_to_app(
+        self, client: TestClient, db: Session, key_headers: dict[str, str], google_http: dict[str, MagicMock]
+    ) -> None:
+        auth = client.get(
+            "/api/v1/oauth/google/authorize",
+            params={"user_id": str(uuid4()), "redirect_uri": ALLOWED_REDIRECT},
+            headers=key_headers,
+        ).json()
+
+        response = client.get(
+            "/api/v1/oauth/google/callback",
+            params={"error": "access_denied", "state": auth["state"]},
+            follow_redirects=False,
+        )
+
+        assert response.status_code == 303
+        assert response.headers["location"].startswith(ALLOWED_REDIRECT + "?")
+        assert parse_qs(urlsplit(response.headers["location"]).query)["error"] == ["access_denied"]
+        google_http["post"].assert_not_called()
+
+    def test_callback_with_unknown_state_is_refused(
+        self, client: TestClient, db: Session, google_http: dict[str, MagicMock]
+    ) -> None:
+        response = client.get(
+            "/api/v1/oauth/google/callback",
+            params={"code": "auth-code", "state": "forged-state"},
+            follow_redirects=False,
+        )
+
+        assert response.status_code == 400
+        google_http["post"].assert_not_called()
 
 
 class TestOAuthProvidersEndpoint:

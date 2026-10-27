@@ -196,6 +196,16 @@ def _configure_redis(_redis_url: str) -> Generator[None, None, None]:
 
 
 @pytest.fixture(autouse=True)
+def _oauth_direct_connect() -> Generator[None, None, None]:
+    """Provider OAuth tests exercise the token exchange itself, so connect directly on callback.
+
+    tests/api/v1/test_oauth.py switches OAUTH_REQUIRE_COMPLETION back on to cover that flow.
+    """
+    with patch.object(settings, "oauth_require_completion", False):
+        yield
+
+
+@pytest.fixture(autouse=True)
 def flush_redis(_redis_url: str) -> Generator[None, None, None]:
     """Flush Redis state before each test to ensure isolation."""
     redis_lib.from_url(_redis_url).flushdb()

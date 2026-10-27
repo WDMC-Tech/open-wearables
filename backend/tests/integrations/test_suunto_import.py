@@ -136,7 +136,7 @@ class TestSuuntoImport:
         with patch("app.services.providers.templates.base_oauth.get_redis_client", return_value=mock_redis):
             # Act
             assert suunto_strategy.oauth is not None
-            oauth_state = suunto_strategy.oauth.handle_callback(db, "test_code", "test_state")
+            oauth_state, _ = suunto_strategy.oauth.handle_callback(db, "test_code", "test_state")
 
             # Assert
             assert oauth_state.user_id == user.id

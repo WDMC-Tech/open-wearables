@@ -28,7 +28,9 @@ class GoogleOAuth(BaseOAuthTemplate):
     credentials are sent in the token request body.
     """
 
-    use_pkce: bool = False
+    # PKCE (S256) on top of the client secret: an intercepted authorization code is useless
+    # without the verifier, which never leaves the server.
+    use_pkce: bool = True
     auth_method: AuthenticationMethod = AuthenticationMethod.BODY
 
     USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
@@ -57,8 +59,9 @@ class GoogleOAuth(BaseOAuthTemplate):
         Adds the Google-specific parameters the base template doesn't emit:
         ``access_type=offline`` (return a refresh token), ``prompt=consent``
         (always return one), and ``include_granted_scopes=true`` (incremental
-        authorization).
+        authorization). Also adds the PKCE challenge; the verifier is stored with the state.
         """
+        code_verifier, code_challenge = self._generate_pkce_pair()
         params = {
             "response_type": "code",
             "client_id": self.credentials.client_id,
@@ -68,8 +71,10 @@ class GoogleOAuth(BaseOAuthTemplate):
             "access_type": "offline",
             "include_granted_scopes": "true",
             "prompt": "consent",
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
         }
-        return f"{self.endpoints.authorize_url}?{urlencode(params)}", None
+        return f"{self.endpoints.authorize_url}?{urlencode(params)}", {"code_verifier": code_verifier}
 
     def _get_provider_user_info(self, token_response: OAuthTokenResponse, user_id: str) -> dict[str, str | None]:
         """Resolve the Google Health API user id (healthUserId) and email.

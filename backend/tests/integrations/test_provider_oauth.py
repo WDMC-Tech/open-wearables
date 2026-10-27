@@ -31,7 +31,7 @@ class TestGarminOAuth:
 
         # Act - follow_redirects=False to capture the redirect
         response = client.get(
-            f"/api/v1/oauth/garmin/authorize?user_id={user.id}",
+            f"/api/v1/oauth/garmin/authorize?user_id={user.id}&redirect_uri=https://beta.givingwellness.org/wearables/callback",
             headers=headers,
             follow_redirects=False,
         )
@@ -126,7 +126,7 @@ class TestPolarOAuth:
 
         # Act
         response = client.get(
-            f"/api/v1/oauth/polar/authorize?user_id={user.id}",
+            f"/api/v1/oauth/polar/authorize?user_id={user.id}&redirect_uri=https://beta.givingwellness.org/wearables/callback",
             headers=headers,
             follow_redirects=False,
         )
@@ -176,7 +176,9 @@ class TestPolarOAuth:
 
         # Get authorization URL to set up OAuth state properly
         assert polar_strategy.oauth
-        auth_url, state = polar_strategy.oauth.get_authorization_url(user.id)
+        auth_url, state = polar_strategy.oauth.get_authorization_url(
+            user.id, "https://beta.givingwellness.org/wearables/callback"
+        )
 
         # Mock token exchange
         mock_response = MagicMock()
@@ -220,7 +222,7 @@ class TestSuuntoOAuth:
 
         # Act
         response = client.get(
-            f"/api/v1/oauth/suunto/authorize?user_id={user.id}",
+            f"/api/v1/oauth/suunto/authorize?user_id={user.id}&redirect_uri=https://beta.givingwellness.org/wearables/callback",
             headers=headers,
             follow_redirects=False,
         )

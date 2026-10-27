@@ -16,7 +16,7 @@ from app.api import head_router
 from app.config import settings
 from app.integrations.celery import create_celery
 from app.integrations.sentry import init_sentry
-from app.middlewares import add_access_log_middleware, add_cors_middleware
+from app.middlewares import add_access_log_middleware, add_cors_middleware, add_security_headers_middleware
 from app.services import raw_payload_storage
 from app.services.outgoing_webhooks import svix as svix_service
 from app.utils.exceptions import DatetimeParseError, handle_exception
@@ -53,7 +53,14 @@ async def _lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
     yield
 
 
-api = FastAPI(title=settings.api_name, lifespan=_lifespan)
+api = FastAPI(
+    title=settings.api_name,
+    lifespan=_lifespan,
+    # Interactive docs and the schema are only served when API_DOCS_ENABLED=true.
+    docs_url="/docs" if settings.api_docs_enabled else None,
+    redoc_url="/redoc" if settings.api_docs_enabled else None,
+    openapi_url="/openapi.json" if settings.api_docs_enabled else None,
+)
 celery_app = create_celery()
 init_sentry()
 raw_payload_storage.configure(
@@ -68,6 +75,7 @@ raw_payload_storage.configure(
 
 add_cors_middleware(api)
 add_access_log_middleware(api)
+add_security_headers_middleware(api)
 
 # Mount static files for provider icons
 static_dir = Path(__file__).parent / "static"

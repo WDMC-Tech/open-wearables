@@ -2,11 +2,12 @@ from datetime import datetime
 from uuid import UUID
 
 from sqlalchemy import Index
-from sqlalchemy.orm import Mapped
+from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import BaseDbModel
 from app.mappings import FKUser, PrimaryKey, str_64
 from app.schemas.auth import ConnectionStatus
+from app.utils.token_crypto import EncryptedText
 
 
 class UserConnection(BaseDbModel):
@@ -37,9 +38,9 @@ class UserConnection(BaseDbModel):
     provider_user_id: Mapped[str | None]
     provider_username: Mapped[str | None]
 
-    # OAuth tokens (optional for SDK-based providers like Apple)
-    access_token: Mapped[str | None]
-    refresh_token: Mapped[str | None]
+    # OAuth tokens (optional for SDK-based providers like Apple). Encrypted at rest.
+    access_token: Mapped[str | None] = mapped_column(EncryptedText)
+    refresh_token: Mapped[str | None] = mapped_column(EncryptedText)
     token_expires_at: Mapped[datetime | None]
     scope: Mapped[str | None]
 

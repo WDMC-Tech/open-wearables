@@ -44,6 +44,31 @@ class Settings(BaseSettings):
     paging_limit: int = 100
     cors_origins: list[AnyHttpUrl] = []
     cors_allow_all: bool = False
+    # Interactive API docs (/docs, /redoc, /openapi.json). Off unless asked for: on an
+    # internet-facing deployment they hand a scanner the full route map.
+    api_docs_enabled: bool = False
+    # Strict-Transport-Security max-age sent on every response; 0 turns the header off.
+    # Browsers ignore it over plain http, so it is harmless on a local http server.
+    hsts_max_age_seconds: int = 31536000
+
+    # OAUTH FLOW SETTINGS
+    # Origins a caller may name as the post-connect redirect_uri. Anything else is refused at
+    # /authorize, so the callback can never bounce a browser to an arbitrary site. Override with
+    # OAUTH_ALLOWED_REDIRECT_ORIGINS='["http://localhost:3000"]' for local development.
+    oauth_allowed_redirect_origins: list[str] = [
+        "https://beta.givingwellness.org",
+        "https://app.givingwellness.org",
+    ]
+    # When true the provider callback only parks the tokens; the connection becomes active once
+    # the integrating app calls POST /oauth/{provider}/complete (API key) for the SAME user that
+    # started the flow. That binds the flow to the signed-in user who began it, so a consent
+    # link started by one account cannot be completed into another account by a third party.
+    oauth_require_completion: bool = True
+    oauth_completion_ttl_seconds: int = 600
+
+    # Key for encrypting provider access/refresh tokens at rest (a Fernet key). When unset, a key
+    # is derived from SECRET_KEY, so rotating SECRET_KEY then means every user reconnects.
+    token_encryption_key: SecretStr | None = None
 
     # None → derived in derive_access_log_level (prod: errors only, else: all)
     access_log_level: AccessLogLevel | None = None

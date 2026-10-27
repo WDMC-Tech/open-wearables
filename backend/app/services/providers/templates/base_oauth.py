@@ -13,6 +13,7 @@ from fastapi import HTTPException
 from redis import Redis
 from starlette.status import HTTP_400_BAD_REQUEST, HTTP_401_UNAUTHORIZED, HTTP_500_INTERNAL_SERVER_ERROR
 
+from app.config import settings
 from app.database import DbSession
 from app.integrations.redis_client import get_redis_client
 from app.repositories.user_connection_repository import UserConnectionRepository
@@ -26,7 +27,9 @@ from app.schemas.model_crud.credentials import (
 )
 from app.schemas.model_crud.user_management import UserConnectionCreate
 from app.services.outgoing_webhooks.events import on_connection_created, on_connection_revoked
+from app.utils.redirects import is_allowed_redirect_uri
 from app.utils.structured_logging import log_structured
+from app.utils.token_crypto import decrypt_bytes, encrypt_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +76,15 @@ class BaseOAuthTemplate(ABC):
         Returns:
             tuple[str, str]: The authorization URL and the state.
         """
+        if redirect_uri is not None and not is_allowed_redirect_uri(
+            redirect_uri, settings.oauth_allowed_redirect_origins
+        ):
+            raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail="redirect_uri is not an allowed origin")
+        if settings.oauth_require_completion and not redirect_uri:
+            # The completion handle travels to the integrating app on this redirect; without
+            # one the connection could never be completed.
+            raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail="redirect_uri is required")
+
         state = secrets.token_urlsafe(32)  # random state 32-bytes (Base64 encoding)
 
         oauth_state = OAuthState(
@@ -100,8 +112,13 @@ class BaseOAuthTemplate(ABC):
 
         return auth_url, state
 
-    def handle_callback(self, db: DbSession, code: str, state: str) -> OAuthState:
-        """Handles the OAuth callback, exchanges code, and saves the connection."""
+    def handle_callback(self, db: DbSession, code: str, state: str) -> tuple[OAuthState, str | None]:
+        """Handles the OAuth callback: exchanges the code, then saves the connection.
+
+        With ``oauth_require_completion`` the tokens are parked (encrypted, short-lived) instead
+        of saved, and the returned completion handle must be passed to ``complete_connection``
+        for the same user. Returns ``(state, completion_or_None)``.
+        """
         oauth_state, code_verifier = self._validate_state(state)
 
         if oauth_state.provider != self.provider_name:
@@ -120,6 +137,28 @@ class BaseOAuthTemplate(ABC):
 
         user_info = self._get_provider_user_info(token_response, str(oauth_state.user_id))
 
+        if settings.oauth_require_completion:
+            completion = secrets.token_urlsafe(32)
+            pending = {
+                "state": oauth_state.model_dump(mode="json"),
+                "token": token_response.model_dump(mode="json"),
+                "user_info": user_info,
+            }
+            self.redis_client.setex(
+                self._pending_key(completion),
+                settings.oauth_completion_ttl_seconds,
+                encrypt_bytes(json.dumps(pending).encode("utf-8")).decode("ascii"),
+            )
+            log_structured(
+                logger,
+                "info",
+                "OAuth callback handled; awaiting completion",
+                provider=self.provider_name,
+                task="handle_callback",
+                user_id=str(oauth_state.user_id),
+            )
+            return oauth_state, completion
+
         self._save_connection(db, oauth_state.user_id, token_response, user_info, oauth_state)
 
         log_structured(
@@ -131,7 +170,61 @@ class BaseOAuthTemplate(ABC):
             user_id=str(oauth_state.user_id),
         )
 
+        return oauth_state, None
+
+    def complete_connection(self, db: DbSession, completion: str, user_id: UUID) -> OAuthState:
+        """Save a connection parked by ``handle_callback``, if ``user_id`` is the user who started it.
+
+        One-time: the parked tokens are discarded on the first attempt whatever its outcome, so a
+        flow begun by another account and completed here is dropped, not retried.
+        """
+        key = self._pending_key(completion)
+        raw = self.redis_client.get(key)
+        if not raw:
+            raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail="Invalid or expired completion")
+        self.redis_client.delete(key)
+
+        raw_str = raw.decode("ascii") if isinstance(raw, bytes) else str(raw)
+        pending = json.loads(decrypt_bytes(raw_str.encode("ascii")))
+        oauth_state = OAuthState.model_validate(pending["state"])
+
+        if oauth_state.provider != self.provider_name or oauth_state.user_id != user_id:
+            log_structured(
+                logger,
+                "warning",
+                "OAuth completion refused: flow belongs to another user or provider",
+                provider=self.provider_name,
+                task="complete_connection",
+                user_id=str(user_id),
+                state_user_id=str(oauth_state.user_id),
+            )
+            raise HTTPException(status_code=403, detail="This connection was started by a different user")
+
+        token_response = OAuthTokenResponse.model_validate(pending["token"])
+        self._save_connection(db, oauth_state.user_id, token_response, pending["user_info"], oauth_state)
+
+        log_structured(
+            logger,
+            "info",
+            "OAuth connection completed",
+            provider=self.provider_name,
+            task="complete_connection",
+            user_id=str(user_id),
+        )
         return oauth_state
+
+    def consume_state(self, state: str) -> OAuthState | None:
+        """Validate and consume ``state`` without exchanging a code (provider-reported errors)."""
+        try:
+            oauth_state, _ = self._validate_state(state)
+        except HTTPException:
+            return None
+        return oauth_state if oauth_state.provider == self.provider_name else None
+
+    @staticmethod
+    def _pending_key(completion: str) -> str:
+        # Keyed by a hash so the handle itself never sits in Redis.
+        return f"oauth_pending:{hashlib.sha256(completion.encode('utf-8')).hexdigest()}"
 
     def refresh_access_token(self, db: DbSession, user_id: UUID, refresh_token: str) -> OAuthTokenResponse:
         """Refreshes the access token using the refresh token."""

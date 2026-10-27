@@ -1,9 +1,11 @@
 from datetime import datetime, timedelta, timezone
 from typing import Annotated
+from urllib.parse import urlencode
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, status
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
 
 from app.config import settings
 from app.database import DbSession
@@ -14,10 +16,11 @@ from app.schemas.model_crud.data_priority import (
     ProviderSettingRead,
     ProviderSettingUpdate,
 )
-from app.services import DeveloperDep, user_connection_service
+from app.services import ApiKeyDep, DeveloperDep, user_connection_service
 from app.services.provider_settings_service import ProviderSettingsService
 from app.services.providers.base_strategy import BaseProviderStrategy
 from app.services.providers.factory import ProviderFactory
+from app.utils.redirects import with_query_params
 
 router = APIRouter()
 factory = ProviderFactory()
@@ -45,13 +48,17 @@ def get_oauth_strategy(provider: ProviderName) -> BaseProviderStrategy:
 )
 def authorize_provider(
     provider: ProviderName,
+    _api_key: ApiKeyDep,
     user_id: Annotated[UUID, Query(description="User ID to connect")],
-    redirect_uri: Annotated[str | None, Query(description="Optional redirect URI after authorization")] = None,
+    redirect_uri: Annotated[
+        str | None, Query(description="Redirect URI after authorization (must be an allowed origin)")
+    ] = None,
 ):
     """
     Initiate OAuth flow for a provider.
 
-    Returns authorization URL where user should be redirected to log in.
+    Requires an API key (or developer token): only the integrating app may start a flow for one of
+    its users. Returns authorization URL where user should be redirected to log in.
     """
     strategy = get_oauth_strategy(provider)
 
@@ -74,11 +81,20 @@ def oauth_callback(
 
     Provider redirects here after user authorizes. Exchanges code for tokens.
     """
+    strategy = get_oauth_strategy(provider)
+    assert strategy.oauth
+
     if error:
-        return RedirectResponse(
-            url=f"/api/v1/oauth/error?message={error}:+{error_description or 'Unknown+error'}",
-            status_code=303,
-        )
+        # Send the person back to the app that started the flow (its redirect_uri was checked
+        # against the allowlist at /authorize) rather than stranding them on a JSON page.
+        failed_state = strategy.oauth.consume_state(state) if state else None
+        if failed_state and failed_state.redirect_uri:
+            return RedirectResponse(
+                url=with_query_params(failed_state.redirect_uri, {"error": error, "provider": provider.value}),
+                status_code=303,
+            )
+        message = f"{error}: {error_description or 'Unknown error'}"
+        return RedirectResponse(url=f"/api/v1/oauth/error?{urlencode({'message': message})}", status_code=303)
 
     if not code or not state:
         return RedirectResponse(
@@ -86,37 +102,18 @@ def oauth_callback(
             status_code=303,
         )
 
-    strategy = get_oauth_strategy(provider)
+    oauth_state, completion = strategy.oauth.handle_callback(db, code, state)
 
-    assert strategy.oauth
-    oauth_state = strategy.oauth.handle_callback(db, code, state)
+    if completion is not None:
+        # Not connected yet: the integrating app finishes it via POST /{provider}/complete as the
+        # signed-in user. redirect_uri is guaranteed here (required when completion is on).
+        assert oauth_state.redirect_uri
+        return RedirectResponse(
+            url=with_query_params(oauth_state.redirect_uri, {"ow_completion": completion, "provider": provider.value}),
+            status_code=303,
+        )
 
-    # Stamp last_synced_at=now so the first periodic sync uses the connection
-    # timestamp as its live-sync cursor and won't attempt to pull all history.
-    user_connection_service.stamp_last_synced_at(db, oauth_state.user_id, provider.value)
-
-    # Grace-period flag: automatically kick off a historical sync so integrators
-    # who haven't yet adopted the explicit /sync/historical call still get backfill.
-    # Controlled by HISTORICAL_SYNC_ON_CONNECT (default: true).
-    if settings.historical_sync_on_connect:
-        caps = strategy.capabilities
-        if caps.webhook_callback:
-            # this code is going to be removed later, so leave inner imports heres
-            from app.integrations.celery.tasks import start_garmin_full_backfill
-
-            start_garmin_full_backfill.delay(str(oauth_state.user_id))
-        elif caps.rest_pull:
-            from app.integrations.celery.tasks import sync_vendor_data
-
-            now = datetime.now(timezone.utc)
-            start_date = (now - timedelta(days=settings.historical_sync_on_connect_days)).isoformat()
-            sync_vendor_data.delay(
-                user_id=str(oauth_state.user_id),
-                start_date=start_date,
-                end_date=now.isoformat(),
-                providers=[provider.value],
-                is_historical=True,
-            )
+    _after_connect(db, strategy, provider, oauth_state.user_id)
 
     # If a specific redirect_uri was requested (e.g. by frontend), redirect there
     if oauth_state.redirect_uri:
@@ -127,6 +124,61 @@ def oauth_callback(
         url=f"/api/v1/oauth/success?provider={provider.value}&user_id={oauth_state.user_id}",
         status_code=303,
     )
+
+
+class OAuthCompleteRequest(BaseModel):
+    user_id: UUID
+    completion: str
+
+
+@router.post("/{provider}/complete", tags=["External: Providers"])
+def complete_oauth(
+    provider: ProviderName,
+    body: OAuthCompleteRequest,
+    db: DbSession,
+    _api_key: ApiKeyDep,
+) -> dict:
+    """
+    Finish a connection parked by the callback (when OAUTH_REQUIRE_COMPLETION is on).
+
+    The integrating app calls this with the ``ow_completion`` value from its redirect and the
+    user it has signed in. The connection is saved only if that user started the flow.
+    """
+    strategy = get_oauth_strategy(provider)
+    assert strategy.oauth
+    oauth_state = strategy.oauth.complete_connection(db, body.completion, body.user_id)
+    _after_connect(db, strategy, provider, oauth_state.user_id)
+    return {"success": True, "provider": provider.value, "user_id": str(oauth_state.user_id)}
+
+
+def _after_connect(db: DbSession, strategy: BaseProviderStrategy, provider: ProviderName, user_id: UUID) -> None:
+    """Post-connection bookkeeping shared by the direct callback and the completion step."""
+    # Stamp last_synced_at=now so the first periodic sync uses the connection
+    # timestamp as its live-sync cursor and won't attempt to pull all history.
+    user_connection_service.stamp_last_synced_at(db, user_id, provider.value)
+
+    # Grace-period flag: automatically kick off a historical sync so integrators
+    # who haven't yet adopted the explicit /sync/historical call still get backfill.
+    # Controlled by HISTORICAL_SYNC_ON_CONNECT (default: true).
+    if settings.historical_sync_on_connect:
+        caps = strategy.capabilities
+        if caps.webhook_callback:
+            # this code is going to be removed later, so leave inner imports heres
+            from app.integrations.celery.tasks import start_garmin_full_backfill
+
+            start_garmin_full_backfill.delay(str(user_id))
+        elif caps.rest_pull:
+            from app.integrations.celery.tasks import sync_vendor_data
+
+            now = datetime.now(timezone.utc)
+            start_date = (now - timedelta(days=settings.historical_sync_on_connect_days)).isoformat()
+            sync_vendor_data.delay(
+                user_id=str(user_id),
+                start_date=start_date,
+                end_date=now.isoformat(),
+                providers=[provider.value],
+                is_historical=True,
+            )
 
 
 @router.get("/success", tags=["System: OAuth"])

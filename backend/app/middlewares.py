@@ -21,7 +21,19 @@ logger = logging.getLogger("app.access")
 #   token              - Withings notify callback (unsigned notifications)
 #   verification_token - Oura subscription verification
 #   hub.verify_token   - Strava subscription validation
-_REDACTED_QUERY_KEYS = frozenset({"token", "verification_token", "hub.verify_token"})
+# Plus the OAuth callback's own parameters: the authorization code (exchangeable for tokens
+# until it is used), the state, and OAuth 1 equivalents.
+_REDACTED_QUERY_KEYS = frozenset(
+    {
+        "token",
+        "verification_token",
+        "hub.verify_token",
+        "code",
+        "state",
+        "oauth_token",
+        "oauth_verifier",
+    }
+)
 _REDACTED = "REDACTED"  # plain word: urlencode would percent-encode brackets
 
 
@@ -51,6 +63,19 @@ def add_cors_middleware(app: FastAPI) -> None:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+
+def add_security_headers_middleware(app: FastAPI) -> None:
+    """HSTS (browsers stay on https for this host) and nosniff on every response."""
+    hsts = f"max-age={settings.hsts_max_age_seconds}" if settings.hsts_max_age_seconds > 0 else None
+
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+        response = await call_next(request)
+        if hsts:
+            response.headers.setdefault("Strict-Transport-Security", hsts)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        return response
 
 
 class _RateWindow:
